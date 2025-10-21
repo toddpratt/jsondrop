@@ -358,7 +358,7 @@ Contributions welcome! Please:
 
 ## License
 
-[Your chosen license]
+MIT
 
 ## Support
 
