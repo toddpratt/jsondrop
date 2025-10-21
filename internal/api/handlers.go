@@ -2,9 +2,13 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"strings"
+	"time"
 
 	"jsondrop/internal/database"
+	"jsondrop/internal/events"
 	"jsondrop/internal/models"
 
 	"github.com/go-chi/chi/v5"
@@ -12,13 +16,15 @@ import (
 
 // Handler holds dependencies for API handlers
 type Handler struct {
-	catalog *database.CatalogDB
+	catalog     *database.CatalogDB
+	broadcaster *events.Broadcaster
 }
 
 // NewHandler creates a new API handler
-func NewHandler(catalog *database.CatalogDB) *Handler {
+func NewHandler(catalog *database.CatalogDB, broadcaster *events.Broadcaster) *Handler {
 	return &Handler{
-		catalog: catalog,
+		catalog:     catalog,
+		broadcaster: broadcaster,
 	}
 }
 
@@ -90,6 +96,197 @@ func (h *Handler) CreateSchema(w http.ResponseWriter, r *http.Request) {
 	}
 
 	respondJSON(w, http.StatusCreated, schema)
+}
+
+// InsertDocument handles POST /api/databases/:id/:collection
+func (h *Handler) InsertDocument(w http.ResponseWriter, r *http.Request) {
+	db := getDatabaseFromContext(r)
+	if db == nil {
+		respondError(w, http.StatusUnauthorized, "Unauthorized", "Invalid authentication")
+		return
+	}
+
+	collection := chi.URLParam(r, "collection")
+	if collection == "" {
+		respondError(w, http.StatusBadRequest, "Bad Request", "Collection name is required")
+		return
+	}
+
+	// Parse request body
+	var req models.InsertDocumentRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "Bad Request", "Invalid JSON body")
+		return
+	}
+
+	if len(req.Data) == 0 {
+		respondError(w, http.StatusBadRequest, "Bad Request", "Document data cannot be empty")
+		return
+	}
+
+	// Get schema for validation
+	schema, err := h.catalog.GetSchema(db.ID, collection)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Internal Server Error", "Failed to get schema")
+		return
+	}
+	if schema == nil {
+		respondError(w, http.StatusNotFound, "Not Found", "Schema does not exist for collection: "+collection)
+		return
+	}
+
+	// Validate document against schema
+	if err := models.ValidateDocument(req.Data, schema); err != nil {
+		respondError(w, http.StatusBadRequest, "Bad Request", "Validation failed: "+err.Error())
+		return
+	}
+
+	// Insert document
+	doc, err := h.catalog.InsertDocument(db.ID, collection, req.Data)
+	if err != nil {
+		// Check if it's a quota error
+		if strings.Contains(err.Error(), "quota exceeded") {
+			respondError(w, http.StatusPaymentRequired, "Quota Exceeded", err.Error())
+			return
+		}
+		respondError(w, http.StatusInternalServerError, "Internal Server Error", err.Error())
+		return
+	}
+
+	respondJSON(w, http.StatusCreated, doc)
+}
+
+// StreamDatabaseEvents handles GET /api/databases/:id/events (SSE)
+func (h *Handler) StreamDatabaseEvents(w http.ResponseWriter, r *http.Request) {
+	db := getDatabaseFromContext(r)
+	if db == nil {
+		respondError(w, http.StatusUnauthorized, "Unauthorized", "Invalid authentication")
+		return
+	}
+
+	// Set SSE headers
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no") // Disable buffering in nginx
+
+	// Subscribe to events
+	listener := h.broadcaster.Subscribe(db.ID)
+	defer h.broadcaster.Unsubscribe(db.ID, listener)
+
+	// Send initial connection message
+	fmt.Fprintf(w, "event: connected\ndata: {\"database_id\":\"%s\",\"timestamp\":\"%s\"}\n\n",
+		db.ID, time.Now().Format(time.RFC3339))
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+
+	// Heartbeat ticker
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	// Stream events
+	for {
+		select {
+		case event := <-listener.Events:
+			// Send event to client
+			fmt.Fprint(w, events.FormatSSE(event))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+
+		case <-ticker.C:
+			// Send heartbeat/ping
+			fmt.Fprint(w, events.FormatPing())
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			h.broadcaster.UpdatePing(listener)
+
+		case <-listener.Done:
+			// Listener was closed by broadcaster
+			return
+
+		case <-r.Context().Done():
+			// Client disconnected
+			return
+		}
+	}
+}
+
+// StreamCollectionEvents handles GET /api/databases/:id/:collection/events (SSE)
+func (h *Handler) StreamCollectionEvents(w http.ResponseWriter, r *http.Request) {
+	db := getDatabaseFromContext(r)
+	if db == nil {
+		respondError(w, http.StatusUnauthorized, "Unauthorized", "Invalid authentication")
+		return
+	}
+
+	collection := chi.URLParam(r, "collection")
+	if collection == "" {
+		respondError(w, http.StatusBadRequest, "Bad Request", "Collection name is required")
+		return
+	}
+
+	// Verify schema exists for this collection
+	schema, err := h.catalog.GetSchema(db.ID, collection)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Internal Server Error", "Failed to verify collection")
+		return
+	}
+	if schema == nil {
+		respondError(w, http.StatusNotFound, "Not Found", "Collection does not exist: "+collection)
+		return
+	}
+
+	// Set SSE headers
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no") // Disable buffering in nginx
+
+	// Subscribe to collection-specific events
+	listener := h.broadcaster.SubscribeCollection(db.ID, collection)
+	defer h.broadcaster.UnsubscribeCollection(db.ID, collection, listener)
+
+	// Send initial connection message
+	fmt.Fprintf(w, "event: connected\ndata: {\"database_id\":\"%s\",\"collection\":\"%s\",\"timestamp\":\"%s\"}\n\n",
+		db.ID, collection, time.Now().Format(time.RFC3339))
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+
+	// Heartbeat ticker
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	// Stream events
+	for {
+		select {
+		case event := <-listener.Events:
+			// Send event to client
+			fmt.Fprint(w, events.FormatSSE(event))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+
+		case <-ticker.C:
+			// Send heartbeat/ping
+			fmt.Fprint(w, events.FormatPing())
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			h.broadcaster.UpdatePing(listener)
+
+		case <-listener.Done:
+			// Listener was closed by broadcaster
+			return
+
+		case <-r.Context().Done():
+			// Client disconnected
+			return
+		}
+	}
 }
 
 // respondJSON writes a JSON response

@@ -11,6 +11,7 @@ import (
 	"jsondrop/internal/api"
 	"jsondrop/internal/config"
 	"jsondrop/internal/database"
+	"jsondrop/internal/events"
 )
 
 func main() {
@@ -29,8 +30,12 @@ func main() {
 	log.Printf("Expiry Days: %d", cfg.ExpiryDays)
 	log.Printf("Expiry Check Interval: %v", cfg.ExpiryCheckInterval)
 
+	// Initialize event broadcaster
+	broadcaster := events.NewBroadcaster()
+	log.Println("Event broadcaster initialized")
+
 	// Initialize catalog database
-	catalog, err := database.NewCatalogDB(cfg.CatalogDBPath, cfg.DBBaseDir, cfg.DefaultQuotaMB)
+	catalog, err := database.NewCatalogDB(cfg.CatalogDBPath, cfg.DBBaseDir, cfg.DefaultQuotaMB, broadcaster)
 	if err != nil {
 		log.Fatalf("Failed to initialize catalog database: %v", err)
 	}
@@ -39,7 +44,7 @@ func main() {
 	log.Println("Catalog database initialized successfully")
 
 	// Create API handler
-	handler := api.NewHandler(catalog)
+	handler := api.NewHandler(catalog, broadcaster)
 
 	// Create router
 	router := api.NewRouter(handler, catalog, cfg.CORSOrigins)

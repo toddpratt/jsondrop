@@ -13,15 +13,21 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
+// EventBroadcaster is an interface for broadcasting events
+type EventBroadcaster interface {
+	Broadcast(dbID string, event models.ChangeEvent)
+}
+
 // CatalogDB manages the catalog database
 type CatalogDB struct {
-	db         *sql.DB
-	dbBaseDir  string
+	db           *sql.DB
+	dbBaseDir    string
 	defaultQuota int64
+	broadcaster  EventBroadcaster
 }
 
 // NewCatalogDB creates a new catalog database connection
-func NewCatalogDB(catalogPath string, dbBaseDir string, defaultQuotaMB int64) (*CatalogDB, error) {
+func NewCatalogDB(catalogPath string, dbBaseDir string, defaultQuotaMB int64, broadcaster EventBroadcaster) (*CatalogDB, error) {
 	// Ensure the directory exists
 	dir := filepath.Dir(catalogPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -42,6 +48,7 @@ func NewCatalogDB(catalogPath string, dbBaseDir string, defaultQuotaMB int64) (*
 		db:           db,
 		dbBaseDir:    dbBaseDir,
 		defaultQuota: defaultQuotaMB * 1024 * 1024, // Convert MB to bytes
+		broadcaster:  broadcaster,
 	}
 
 	if err := catalog.initSchema(); err != nil {
@@ -310,12 +317,30 @@ func (c *CatalogDB) CreateSchema(dbID string, name string, fields map[string]mod
 		return nil, fmt.Errorf("failed to create collection table: %w", err)
 	}
 
-	return &models.Schema{
+	schema := &models.Schema{
 		DatabaseID: dbID,
 		Name:       name,
 		Fields:     fields,
 		CreatedAt:  time.Unix(now, 0),
-	}, nil
+	}
+
+	// Broadcast schema creation event
+	if c.broadcaster != nil {
+		event := models.ChangeEvent{
+			EventType:  "schema_created",
+			DatabaseID: dbID,
+			Collection: name,
+			DocumentID: "", // Not applicable for schema events
+			Data: map[string]interface{}{
+				"schema_name": name,
+				"fields":      fields,
+			},
+			Timestamp: time.Unix(now, 0),
+		}
+		c.broadcaster.Broadcast(dbID, event)
+	}
+
+	return schema, nil
 }
 
 // createCollectionTable creates a table in a user's database file
