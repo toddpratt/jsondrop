@@ -1,0 +1,29 @@
+
+services:
+  jsondrop:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - DB_BASE_DIR=/app/data
+      - CATALOG_DB_PATH=/app/data/catalog.db
+      - CORS_ORIGINS=*
+      - DEFAULT_QUOTA_MB=100
+      - EXPIRY_DAYS=30
+      - EXPIRY_CHECK_INTERVAL=24h
+    volumes:
+      - jsondrop-data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/api/databases"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  jsondrop-data:
+    driver: local
