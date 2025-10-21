@@ -276,10 +276,19 @@ func (c *CatalogDB) DeleteDatabase(dbID string) error {
 
 // CreateSchema creates a new schema for a collection
 func (c *CatalogDB) CreateSchema(dbID string, name string, fields map[string]models.FieldType) (*models.Schema, error) {
+	// Validate collection name to prevent SQL injection
+	if err := ValidateIdentifier(name); err != nil {
+		return nil, fmt.Errorf("invalid schema name: %w", err)
+	}
+
 	// Validate fields
 	for fieldName, fieldType := range fields {
 		if fieldName == "" {
 			return nil, fmt.Errorf("field name cannot be empty")
+		}
+		// Validate field names to prevent SQL injection
+		if err := ValidateIdentifier(fieldName); err != nil {
+			return nil, fmt.Errorf("invalid field name %s: %w", fieldName, err)
 		}
 		if !fieldType.IsValid() {
 			return nil, fmt.Errorf("invalid field type for %s: %s", fieldName, fieldType)
@@ -351,8 +360,11 @@ func (c *CatalogDB) createCollectionTable(dbPath string, collectionName string, 
 	}
 	defer db.Close()
 
-	// Build CREATE TABLE statement
-	createSQL := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (", collectionName)
+	// Quote the table name to prevent SQL injection
+	quotedName := QuoteIdentifier(collectionName)
+
+	// Build CREATE TABLE statement with quoted identifier
+	createSQL := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (", quotedName)
 	createSQL += "id TEXT PRIMARY KEY, "
 	createSQL += "created_at INTEGER NOT NULL, "
 	createSQL += "updated_at INTEGER NOT NULL, "
@@ -363,7 +375,7 @@ func (c *CatalogDB) createCollectionTable(dbPath string, collectionName string, 
 		return fmt.Errorf("failed to create table: %w", err)
 	}
 
-	// Register collection
+	// Register collection (using parameterized query - safe)
 	_, err = db.Exec(
 		"INSERT OR IGNORE INTO _collections (name, created_at) VALUES (?, ?)",
 		collectionName,
@@ -438,8 +450,9 @@ func (c *CatalogDB) DeleteSchema(dbID string, name string) error {
 	}
 	defer db.Close()
 
-	// Drop the collection table
-	dropQuery := fmt.Sprintf(`DROP TABLE IF EXISTS %s`, name)
+	// Drop the collection table with quoted identifier
+	quotedName := QuoteIdentifier(name)
+	dropQuery := fmt.Sprintf(`DROP TABLE IF EXISTS %s`, quotedName)
 	_, err = db.Exec(dropQuery)
 	if err != nil {
 		return fmt.Errorf("failed to drop table: %w", err)

@@ -34,11 +34,12 @@ func (c *CatalogDB) InsertDocument(dbID string, collection string, data map[stri
 	}
 	defer db.Close()
 
-	// Insert document
+	// Insert document with quoted identifier
+	quotedCollection := QuoteIdentifier(collection)
 	query := fmt.Sprintf(`
 		INSERT INTO %s (id, created_at, updated_at, data)
 		VALUES (?, ?, ?, ?)
-	`, collection)
+	`, quotedCollection)
 
 	_, err = db.Exec(query, docID, now, now, string(dataJSON))
 	if err != nil {
@@ -49,7 +50,7 @@ func (c *CatalogDB) InsertDocument(dbID string, collection string, data map[stri
 	documentSize := int64(len(dataJSON))
 	if err := c.updateQuotaAfterInsert(dbID, documentSize); err != nil {
 		// Try to rollback the insert
-		db.Exec(fmt.Sprintf("DELETE FROM %s WHERE id = ?", collection), docID)
+		db.Exec(fmt.Sprintf("DELETE FROM %s WHERE id = ?", quotedCollection), docID)
 		return nil, err
 	}
 
@@ -117,11 +118,12 @@ func (c *CatalogDB) GetDocument(dbID string, collection string, docID string) (*
 	}
 	defer db.Close()
 
+	quotedCollection := QuoteIdentifier(collection)
 	query := fmt.Sprintf(`
 		SELECT id, created_at, updated_at, data
 		FROM %s
 		WHERE id = ?
-	`, collection)
+	`, quotedCollection)
 
 	var doc models.Document
 	var createdAt, updatedAt int64
@@ -162,12 +164,13 @@ func (c *CatalogDB) QueryDocuments(dbID string, collection string, limit int, of
 	}
 	defer db.Close()
 
-	// Build query
+	// Build query with quoted identifier
+	quotedCollection := QuoteIdentifier(collection)
 	query := fmt.Sprintf(`
 		SELECT id, created_at, updated_at, data
 		FROM %s
 		ORDER BY created_at DESC
-	`, collection)
+	`, quotedCollection)
 
 	// Add limit and offset
 	if limit > 0 {
@@ -284,9 +287,11 @@ func (c *CatalogDB) DeleteDocument(dbID string, collection string, docID string)
 	}
 	defer db.Close()
 
+	quotedCollection := QuoteIdentifier(collection)
+
 	// Get document size before deletion for quota update
 	var dataJSON string
-	query := fmt.Sprintf(`SELECT data FROM %s WHERE id = ?`, collection)
+	query := fmt.Sprintf(`SELECT data FROM %s WHERE id = ?`, quotedCollection)
 	err = db.QueryRow(query, docID).Scan(&dataJSON)
 	if err == sql.ErrNoRows {
 		return fmt.Errorf("document not found")
@@ -298,7 +303,7 @@ func (c *CatalogDB) DeleteDocument(dbID string, collection string, docID string)
 	documentSize := int64(len(dataJSON))
 
 	// Delete the document
-	deleteQuery := fmt.Sprintf(`DELETE FROM %s WHERE id = ?`, collection)
+	deleteQuery := fmt.Sprintf(`DELETE FROM %s WHERE id = ?`, quotedCollection)
 	result, err := db.Exec(deleteQuery, docID)
 	if err != nil {
 		return fmt.Errorf("failed to delete document: %w", err)
@@ -349,9 +354,11 @@ func (c *CatalogDB) UpdateDocument(dbID string, collection string, docID string,
 	}
 	defer db.Close()
 
+	quotedCollection := QuoteIdentifier(collection)
+
 	// Get old document size for quota update
 	var oldDataJSON string
-	query := fmt.Sprintf(`SELECT data FROM %s WHERE id = ?`, collection)
+	query := fmt.Sprintf(`SELECT data FROM %s WHERE id = ?`, quotedCollection)
 	err = db.QueryRow(query, docID).Scan(&oldDataJSON)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("document not found")
@@ -376,7 +383,7 @@ func (c *CatalogDB) UpdateDocument(dbID string, collection string, docID string,
 		UPDATE %s
 		SET data = ?, updated_at = ?
 		WHERE id = ?
-	`, collection)
+	`, quotedCollection)
 
 	result, err := db.Exec(updateQuery, string(newDataJSON), now, docID)
 	if err != nil {
@@ -400,7 +407,7 @@ func (c *CatalogDB) UpdateDocument(dbID string, collection string, docID string,
 			// Check if quota would be exceeded
 			if sizeDelta > 0 && newQuotaUsed > quotaLimit {
 				// Rollback: restore old data
-				db.Exec(fmt.Sprintf("UPDATE %s SET data = ?, updated_at = (SELECT updated_at FROM %s WHERE id = ?) WHERE id = ?", collection, collection), oldDataJSON, docID, docID)
+				db.Exec(fmt.Sprintf("UPDATE %s SET data = ?, updated_at = (SELECT updated_at FROM %s WHERE id = ?) WHERE id = ?", quotedCollection, quotedCollection), oldDataJSON, docID, docID)
 				return nil, fmt.Errorf("quota exceeded: current %d bytes, limit %d bytes, attempted to add %d bytes",
 					quotaUsed, quotaLimit, sizeDelta)
 			}
@@ -414,7 +421,7 @@ func (c *CatalogDB) UpdateDocument(dbID string, collection string, docID string,
 
 	// Get created_at for response
 	var createdAt int64
-	err = db.QueryRow(fmt.Sprintf("SELECT created_at FROM %s WHERE id = ?", collection), docID).Scan(&createdAt)
+	err = db.QueryRow(fmt.Sprintf("SELECT created_at FROM %s WHERE id = ?", quotedCollection), docID).Scan(&createdAt)
 	if err != nil {
 		createdAt = now
 	}
