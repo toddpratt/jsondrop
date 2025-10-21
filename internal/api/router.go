@@ -27,21 +27,29 @@ func NewRouter(handler *Handler, catalog *database.CatalogDB, corsOrigins []stri
 		r.Route("/databases/{id}", func(r chi.Router) {
 			r.Use(authMiddleware(catalog))
 
+			// Database deletion (write key required)
+			r.With(requireWriteKey).Delete("/", handler.DeleteDatabase)
+
 			// SSE endpoint for database events (read or write key)
 			r.Get("/events", handler.StreamDatabaseEvents)
 
-			// Schema creation (write key required)
+			// Schema operations
 			r.With(requireWriteKey).Post("/schemas/{name}", handler.CreateSchema)
+			r.With(requireWriteKey).Delete("/schemas/{name}", handler.DeleteSchema)
 
 			// Collection-specific routes
 			r.Route("/{collection}", func(r chi.Router) {
 				// SSE endpoint for collection-specific events (read or write key)
 				r.Get("/events", handler.StreamCollectionEvents)
 
+				// Query documents (read or write key)
+				r.Get("/", handler.QueryDocuments)
+
 				// Document operations (write key required)
 				r.With(requireWriteKey).Post("/", handler.InsertDocument)
+				r.With(requireWriteKey).Delete("/{docId}", handler.DeleteDocument)
 
-				// TODO: Add GET, PUT, DELETE for documents
+				// TODO: Add PUT for documents
 			})
 		})
 	})

@@ -412,6 +412,63 @@ func (c *CatalogDB) GetSchema(dbID string, name string) (*models.Schema, error) 
 	return &schema, nil
 }
 
+// DeleteSchema deletes a schema and drops the collection table
+func (c *CatalogDB) DeleteSchema(dbID string, name string) error {
+	// Verify schema exists
+	schema, err := c.GetSchema(dbID, name)
+	if err != nil {
+		return err
+	}
+	if schema == nil {
+		return fmt.Errorf("schema not found")
+	}
+
+	// Delete from catalog
+	query := `DELETE FROM schemas WHERE database_id = ? AND name = ?`
+	_, err = c.db.Exec(query, dbID, name)
+	if err != nil {
+		return fmt.Errorf("failed to delete schema from catalog: %w", err)
+	}
+
+	// Drop the table from the database file
+	dbPath := c.getDatabasePath(dbID)
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		return fmt.Errorf("failed to open database: %w", err)
+	}
+	defer db.Close()
+
+	// Drop the collection table
+	dropQuery := fmt.Sprintf(`DROP TABLE IF EXISTS %s`, name)
+	_, err = db.Exec(dropQuery)
+	if err != nil {
+		return fmt.Errorf("failed to drop table: %w", err)
+	}
+
+	// Remove from collections registry
+	_, err = db.Exec(`DELETE FROM _collections WHERE name = ?`, name)
+	if err != nil {
+		// Log but don't fail
+	}
+
+	// Broadcast schema deletion event
+	if c.broadcaster != nil {
+		event := models.ChangeEvent{
+			EventType:  "schema_deleted",
+			DatabaseID: dbID,
+			Collection: name,
+			DocumentID: "",
+			Data: map[string]interface{}{
+				"schema_name": name,
+			},
+			Timestamp: time.Now(),
+		}
+		c.broadcaster.Broadcast(dbID, event)
+	}
+
+	return nil
+}
+
 // Close closes the catalog database connection
 func (c *CatalogDB) Close() error {
 	return c.db.Close()

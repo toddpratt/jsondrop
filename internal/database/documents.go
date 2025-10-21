@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
 	"jsondrop/internal/models"
@@ -152,8 +153,8 @@ func (c *CatalogDB) GetDocument(dbID string, collection string, docID string) (*
 	return &doc, nil
 }
 
-// QueryDocuments retrieves all documents from a collection
-func (c *CatalogDB) QueryDocuments(dbID string, collection string) ([]*models.Document, error) {
+// QueryDocuments retrieves documents from a collection with pagination and filtering
+func (c *CatalogDB) QueryDocuments(dbID string, collection string, limit int, offset int, filters map[string][]string) ([]*models.Document, error) {
 	dbPath := c.getDatabasePath(dbID)
 	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
@@ -161,11 +162,20 @@ func (c *CatalogDB) QueryDocuments(dbID string, collection string) ([]*models.Do
 	}
 	defer db.Close()
 
+	// Build query
 	query := fmt.Sprintf(`
 		SELECT id, created_at, updated_at, data
 		FROM %s
 		ORDER BY created_at DESC
 	`, collection)
+
+	// Add limit and offset
+	if limit > 0 {
+		query += fmt.Sprintf(" LIMIT %d", limit)
+	}
+	if offset > 0 {
+		query += fmt.Sprintf(" OFFSET %d", offset)
+	}
 
 	rows, err := db.Query(query)
 	if err != nil {
@@ -198,8 +208,134 @@ func (c *CatalogDB) QueryDocuments(dbID string, collection string) ([]*models.Do
 		doc.CreatedAt = time.Unix(createdAt, 0)
 		doc.UpdatedAt = time.Unix(updatedAt, 0)
 
-		documents = append(documents, &doc)
+		// Apply in-memory filtering
+		if matchesFilters(&doc, filters) {
+			documents = append(documents, &doc)
+		}
 	}
 
 	return documents, rows.Err()
+}
+
+// matchesFilters checks if a document matches the provided filters
+// Multiple values for the same field are treated as OR (IN list)
+func matchesFilters(doc *models.Document, filters map[string][]string) bool {
+	if len(filters) == 0 {
+		return true
+	}
+
+	for fieldName, filterValues := range filters {
+		if len(filterValues) == 0 {
+			continue
+		}
+
+		// Get the field value from the document
+		fieldValue, exists := doc.Data[fieldName]
+		if !exists {
+			return false // Field doesn't exist in document
+		}
+
+		// Check if field value matches any of the filter values (OR logic)
+		matched := false
+		for _, filterValue := range filterValues {
+			if matchesValue(fieldValue, filterValue) {
+				matched = true
+				break
+			}
+		}
+
+		if !matched {
+			return false // AND logic between different fields
+		}
+	}
+
+	return true
+}
+
+// matchesValue checks if a field value matches a filter value
+func matchesValue(fieldValue interface{}, filterValue string) bool {
+	switch v := fieldValue.(type) {
+	case string:
+		return v == filterValue
+	case float64:
+		// Try to parse filter as number
+		if filterNum, err := strconv.ParseFloat(filterValue, 64); err == nil {
+			return v == filterNum
+		}
+		return false
+	case bool:
+		// Try to parse filter as boolean
+		if filterBool, err := strconv.ParseBool(filterValue); err == nil {
+			return v == filterBool
+		}
+		return false
+	default:
+		// Convert to string and compare
+		return fmt.Sprintf("%v", fieldValue) == filterValue
+	}
+}
+
+// DeleteDocument deletes a single document by ID
+func (c *CatalogDB) DeleteDocument(dbID string, collection string, docID string) error {
+	dbPath := c.getDatabasePath(dbID)
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		return fmt.Errorf("failed to open database: %w", err)
+	}
+	defer db.Close()
+
+	// Get document size before deletion for quota update
+	var dataJSON string
+	query := fmt.Sprintf(`SELECT data FROM %s WHERE id = ?`, collection)
+	err = db.QueryRow(query, docID).Scan(&dataJSON)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("document not found")
+	}
+	if err != nil {
+		return fmt.Errorf("failed to get document: %w", err)
+	}
+
+	documentSize := int64(len(dataJSON))
+
+	// Delete the document
+	deleteQuery := fmt.Sprintf(`DELETE FROM %s WHERE id = ?`, collection)
+	result, err := db.Exec(deleteQuery, docID)
+	if err != nil {
+		return fmt.Errorf("failed to delete document: %w", err)
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		return fmt.Errorf("document not found")
+	}
+
+	// Update quota
+	var quotaUsed int64
+	quotaQuery := `SELECT quota_used FROM databases WHERE id = ?`
+	err = c.db.QueryRow(quotaQuery, dbID).Scan(&quotaUsed)
+	if err != nil {
+		// Log error but don't fail the delete
+		return nil
+	}
+
+	newQuotaUsed := quotaUsed - documentSize
+	if newQuotaUsed < 0 {
+		newQuotaUsed = 0
+	}
+	c.UpdateQuotaUsed(dbID, newQuotaUsed)
+
+	// Broadcast delete event
+	if c.broadcaster != nil {
+		event := models.ChangeEvent{
+			EventType:  "delete",
+			DatabaseID: dbID,
+			Collection: collection,
+			DocumentID: docID,
+			Data:       nil, // No data for delete events
+			Timestamp:  time.Now(),
+		}
+		c.broadcaster.Broadcast(dbID, event)
+	}
+
+	return nil
 }

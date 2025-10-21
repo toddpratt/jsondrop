@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -287,6 +288,159 @@ func (h *Handler) StreamCollectionEvents(w http.ResponseWriter, r *http.Request)
 			return
 		}
 	}
+}
+
+// QueryDocuments handles GET /api/databases/:id/:collection
+func (h *Handler) QueryDocuments(w http.ResponseWriter, r *http.Request) {
+	db := getDatabaseFromContext(r)
+	if db == nil {
+		respondError(w, http.StatusUnauthorized, "Unauthorized", "Invalid authentication")
+		return
+	}
+
+	collection := chi.URLParam(r, "collection")
+	if collection == "" {
+		respondError(w, http.StatusBadRequest, "Bad Request", "Collection name is required")
+		return
+	}
+
+	// Verify schema exists for this collection
+	schema, err := h.catalog.GetSchema(db.ID, collection)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Internal Server Error", "Failed to verify collection")
+		return
+	}
+	if schema == nil {
+		respondError(w, http.StatusNotFound, "Not Found", "Collection does not exist: "+collection)
+		return
+	}
+
+	// Parse pagination parameters
+	limit := 100 // Default limit
+	offset := 0
+
+	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
+		if parsedLimit, err := strconv.Atoi(limitStr); err == nil && parsedLimit > 0 {
+			limit = parsedLimit
+			if limit > 1000 {
+				limit = 1000 // Max limit
+			}
+		}
+	}
+
+	if offsetStr := r.URL.Query().Get("offset"); offsetStr != "" {
+		if parsedOffset, err := strconv.Atoi(offsetStr); err == nil && parsedOffset >= 0 {
+			offset = parsedOffset
+		}
+	}
+
+	// Parse filters from query parameters
+	// Multiple values for same parameter are treated as OR (IN list)
+	filters := make(map[string][]string)
+	for key, values := range r.URL.Query() {
+		// Skip pagination parameters
+		if key == "limit" || key == "offset" {
+			continue
+		}
+		// Only include fields that exist in the schema
+		if _, exists := schema.Fields[key]; exists {
+			filters[key] = values
+		}
+	}
+
+	// Query documents
+	documents, err := h.catalog.QueryDocuments(db.ID, collection, limit, offset, filters)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Internal Server Error", err.Error())
+		return
+	}
+
+	// Return empty array if no documents found
+	if documents == nil {
+		documents = []*models.Document{}
+	}
+
+	respondJSON(w, http.StatusOK, documents)
+}
+
+// DeleteDocument handles DELETE /api/databases/:id/:collection/:docId
+func (h *Handler) DeleteDocument(w http.ResponseWriter, r *http.Request) {
+	db := getDatabaseFromContext(r)
+	if db == nil {
+		respondError(w, http.StatusUnauthorized, "Unauthorized", "Invalid authentication")
+		return
+	}
+
+	collection := chi.URLParam(r, "collection")
+	if collection == "" {
+		respondError(w, http.StatusBadRequest, "Bad Request", "Collection name is required")
+		return
+	}
+
+	docID := chi.URLParam(r, "docId")
+	if docID == "" {
+		respondError(w, http.StatusBadRequest, "Bad Request", "Document ID is required")
+		return
+	}
+
+	// Delete document
+	err := h.catalog.DeleteDocument(db.ID, collection, docID)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			respondError(w, http.StatusNotFound, "Not Found", err.Error())
+			return
+		}
+		respondError(w, http.StatusInternalServerError, "Internal Server Error", err.Error())
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// DeleteSchema handles DELETE /api/databases/:id/schemas/:name
+func (h *Handler) DeleteSchema(w http.ResponseWriter, r *http.Request) {
+	db := getDatabaseFromContext(r)
+	if db == nil {
+		respondError(w, http.StatusUnauthorized, "Unauthorized", "Invalid authentication")
+		return
+	}
+
+	schemaName := chi.URLParam(r, "name")
+	if schemaName == "" {
+		respondError(w, http.StatusBadRequest, "Bad Request", "Schema name is required")
+		return
+	}
+
+	// Delete schema
+	err := h.catalog.DeleteSchema(db.ID, schemaName)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			respondError(w, http.StatusNotFound, "Not Found", err.Error())
+			return
+		}
+		respondError(w, http.StatusInternalServerError, "Internal Server Error", err.Error())
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// DeleteDatabase handles DELETE /api/databases/:id
+func (h *Handler) DeleteDatabase(w http.ResponseWriter, r *http.Request) {
+	db := getDatabaseFromContext(r)
+	if db == nil {
+		respondError(w, http.StatusUnauthorized, "Unauthorized", "Invalid authentication")
+		return
+	}
+
+	// Delete database
+	err := h.catalog.DeleteDatabase(db.ID)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Internal Server Error", err.Error())
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // respondJSON writes a JSON response
