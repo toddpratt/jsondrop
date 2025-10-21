@@ -339,3 +339,106 @@ func (c *CatalogDB) DeleteDocument(dbID string, collection string, docID string)
 
 	return nil
 }
+
+// UpdateDocument updates an existing document by ID
+func (c *CatalogDB) UpdateDocument(dbID string, collection string, docID string, data map[string]interface{}) (*models.Document, error) {
+	dbPath := c.getDatabasePath(dbID)
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open database: %w", err)
+	}
+	defer db.Close()
+
+	// Get old document size for quota update
+	var oldDataJSON string
+	query := fmt.Sprintf(`SELECT data FROM %s WHERE id = ?`, collection)
+	err = db.QueryRow(query, docID).Scan(&oldDataJSON)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("document not found")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get document: %w", err)
+	}
+
+	oldSize := int64(len(oldDataJSON))
+
+	// Marshal new data to JSON
+	newDataJSON, err := json.Marshal(data)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal document data: %w", err)
+	}
+
+	newSize := int64(len(newDataJSON))
+	now := time.Now().Unix()
+
+	// Update document
+	updateQuery := fmt.Sprintf(`
+		UPDATE %s
+		SET data = ?, updated_at = ?
+		WHERE id = ?
+	`, collection)
+
+	result, err := db.Exec(updateQuery, string(newDataJSON), now, docID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to update document: %w", err)
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		return nil, fmt.Errorf("document not found")
+	}
+
+	// Update quota if size changed
+	sizeDelta := newSize - oldSize
+	if sizeDelta != 0 {
+		var quotaUsed, quotaLimit int64
+		quotaQuery := `SELECT quota_used, quota_limit FROM databases WHERE id = ?`
+		err = c.db.QueryRow(quotaQuery, dbID).Scan(&quotaUsed, &quotaLimit)
+		if err == nil {
+			newQuotaUsed := quotaUsed + sizeDelta
+
+			// Check if quota would be exceeded
+			if sizeDelta > 0 && newQuotaUsed > quotaLimit {
+				// Rollback: restore old data
+				db.Exec(fmt.Sprintf("UPDATE %s SET data = ?, updated_at = (SELECT updated_at FROM %s WHERE id = ?) WHERE id = ?", collection, collection), oldDataJSON, docID, docID)
+				return nil, fmt.Errorf("quota exceeded: current %d bytes, limit %d bytes, attempted to add %d bytes",
+					quotaUsed, quotaLimit, sizeDelta)
+			}
+
+			if newQuotaUsed < 0 {
+				newQuotaUsed = 0
+			}
+			c.UpdateQuotaUsed(dbID, newQuotaUsed)
+		}
+	}
+
+	// Get created_at for response
+	var createdAt int64
+	err = db.QueryRow(fmt.Sprintf("SELECT created_at FROM %s WHERE id = ?", collection), docID).Scan(&createdAt)
+	if err != nil {
+		createdAt = now
+	}
+
+	doc := &models.Document{
+		ID:         docID,
+		Collection: collection,
+		Data:       data,
+		CreatedAt:  time.Unix(createdAt, 0),
+		UpdatedAt:  time.Unix(now, 0),
+	}
+
+	// Broadcast update event
+	if c.broadcaster != nil {
+		event := models.ChangeEvent{
+			EventType:  "update",
+			DatabaseID: dbID,
+			Collection: collection,
+			DocumentID: docID,
+			Data:       data,
+			Timestamp:  time.Unix(now, 0),
+		}
+		c.broadcaster.Broadcast(dbID, event)
+	}
+
+	return doc, nil
+}

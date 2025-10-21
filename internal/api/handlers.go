@@ -397,6 +397,73 @@ func (h *Handler) DeleteDocument(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// UpdateDocument handles PUT /api/databases/:id/:collection/:docId
+func (h *Handler) UpdateDocument(w http.ResponseWriter, r *http.Request) {
+	db := getDatabaseFromContext(r)
+	if db == nil {
+		respondError(w, http.StatusUnauthorized, "Unauthorized", "Invalid authentication")
+		return
+	}
+
+	collection := chi.URLParam(r, "collection")
+	if collection == "" {
+		respondError(w, http.StatusBadRequest, "Bad Request", "Collection name is required")
+		return
+	}
+
+	docID := chi.URLParam(r, "docId")
+	if docID == "" {
+		respondError(w, http.StatusBadRequest, "Bad Request", "Document ID is required")
+		return
+	}
+
+	// Parse request body
+	var req models.UpdateDocumentRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "Bad Request", "Invalid JSON body")
+		return
+	}
+
+	if len(req.Data) == 0 {
+		respondError(w, http.StatusBadRequest, "Bad Request", "Document data cannot be empty")
+		return
+	}
+
+	// Get schema for validation
+	schema, err := h.catalog.GetSchema(db.ID, collection)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Internal Server Error", "Failed to get schema")
+		return
+	}
+	if schema == nil {
+		respondError(w, http.StatusNotFound, "Not Found", "Schema does not exist for collection: "+collection)
+		return
+	}
+
+	// Validate document against schema
+	if err := models.ValidateDocument(req.Data, schema); err != nil {
+		respondError(w, http.StatusBadRequest, "Bad Request", "Validation failed: "+err.Error())
+		return
+	}
+
+	// Update document
+	doc, err := h.catalog.UpdateDocument(db.ID, collection, docID, req.Data)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			respondError(w, http.StatusNotFound, "Not Found", err.Error())
+			return
+		}
+		if strings.Contains(err.Error(), "quota exceeded") {
+			respondError(w, http.StatusPaymentRequired, "Quota Exceeded", err.Error())
+			return
+		}
+		respondError(w, http.StatusInternalServerError, "Internal Server Error", err.Error())
+		return
+	}
+
+	respondJSON(w, http.StatusOK, doc)
+}
+
 // DeleteSchema handles DELETE /api/databases/:id/schemas/:name
 func (h *Handler) DeleteSchema(w http.ResponseWriter, r *http.Request) {
 	db := getDatabaseFromContext(r)

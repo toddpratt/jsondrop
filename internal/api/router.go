@@ -47,9 +47,8 @@ func NewRouter(handler *Handler, catalog *database.CatalogDB, corsOrigins []stri
 
 				// Document operations (write key required)
 				r.With(requireWriteKey).Post("/", handler.InsertDocument)
+				r.With(requireWriteKey).Put("/{docId}", handler.UpdateDocument)
 				r.With(requireWriteKey).Delete("/{docId}", handler.DeleteDocument)
-
-				// TODO: Add PUT for documents
 			})
 		})
 	})
